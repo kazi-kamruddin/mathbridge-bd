@@ -10,6 +10,74 @@ from google import genai
 from .config import ERROR_CATEGORIES, LEVEL_GUIDANCE, MODEL_NAME, STATUS_OPTIONS
 
 
+STUDENT_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {"type": "string", "enum": STATUS_OPTIONS},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "question_transcription": {"type": "string"},
+        "answer_transcription": {"type": "string"},
+        "first_error_step": {"type": "string"},
+        "first_error_explanation": {"type": "string"},
+        "error_category": {"type": "string", "enum": ERROR_CATEGORIES},
+        "what_was_done_well": {"type": "array", "items": {"type": "string"}},
+        "corrected_solution_steps": {"type": "array", "items": {"type": "string"}},
+        "remediation_lesson": {"type": "string"},
+        "retry_problem": {"type": "string"},
+        "retry_answer": {"type": "string"},
+        "copyable_solution": {"type": "string"},
+        "follow_up_suggestions": {"type": "array", "items": {"type": "string"}},
+        "teacher_note": {"type": "string"},
+    },
+    "required": [
+        "status",
+        "confidence",
+        "question_transcription",
+        "answer_transcription",
+        "first_error_step",
+        "first_error_explanation",
+        "error_category",
+        "what_was_done_well",
+        "corrected_solution_steps",
+        "remediation_lesson",
+        "retry_problem",
+        "retry_answer",
+        "copyable_solution",
+        "follow_up_suggestions",
+        "teacher_note",
+    ],
+}
+
+
+PDF_EXPORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "verdict": {"type": "string"},
+        "transcriptions": {"type": "string"},
+        "first_mistake": {"type": "string"},
+        "what_was_correct": {"type": "string"},
+        "corrected_solution": {"type": "string"},
+        "remediation": {"type": "string"},
+        "retry_practice": {"type": "string"},
+        "conversation_summary": {"type": "string"},
+    },
+    "required": [
+        "title",
+        "verdict",
+        "transcriptions",
+        "first_mistake",
+        "what_was_correct",
+        "corrected_solution",
+        "remediation",
+        "retry_practice",
+        "conversation_summary",
+    ],
+}
+
+
 @st.cache_resource
 def get_client():
     api_key = st.secrets.get("GEMMA_API_KEY")
@@ -32,21 +100,97 @@ def upload_to_gemma(uploaded_file):
 
 
 def extract_json(text: str) -> Any:
-    cleaned = text.strip()
+    """Best-effort parser retained as a fallback for models/endpoints without schema support."""
+    cleaned = (text or "").strip().lstrip("\ufeff")
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
+
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    for pattern in [r"\{.*\}", r"\[.*\]"]:
-        match = re.search(pattern, cleaned, flags=re.DOTALL)
-        if match:
+
+    decoder = json.JSONDecoder()
+    for start_char in ("{", "["):
+        start = cleaned.find(start_char)
+        while start != -1:
             try:
-                return json.loads(match.group(0))
+                value, _ = decoder.raw_decode(cleaned[start:])
+                return value
             except json.JSONDecodeError:
-                continue
-    raise ValueError("Gemma did not return valid JSON. Please retry.")
+                start = cleaned.find(start_char, start + 1)
+
+    raise ValueError("Gemma did not return valid JSON.")
+
+
+def _generate_structured(contents: list[Any] | str, schema: dict[str, Any], purpose: str) -> Any:
+    """Request schema-constrained JSON, with a repair fallback for API/model variance."""
+    client = get_client()
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": schema,
+                "temperature": 0.1,
+            },
+        )
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None:
+            if hasattr(parsed, "model_dump"):
+                return parsed.model_dump()
+            return parsed
+        return extract_json(response.text or "")
+    except Exception as structured_error:
+        # Some model/API combinations may not accept response_json_schema.
+        # Make one ordinary call, then repair only if its JSON is malformed.
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config={"temperature": 0.1},
+        )
+        raw = response.text or ""
+        try:
+            return extract_json(raw)
+        except ValueError:
+            repair_prompt = f"""
+Convert the following malformed model output into ONE valid JSON value for this purpose:
+{purpose}
+
+Required JSON Schema:
+{json.dumps(schema, ensure_ascii=False)}
+
+Rules:
+- Preserve the original mathematical meaning.
+- Do not add commentary or Markdown fences.
+- Return JSON only.
+
+Malformed output:
+{raw}
+"""
+            repaired = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=repair_prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": schema,
+                    "temperature": 0,
+                },
+            )
+            try:
+                parsed = getattr(repaired, "parsed", None)
+                if parsed is not None:
+                    if hasattr(parsed, "model_dump"):
+                        return parsed.model_dump()
+                    return parsed
+                return extract_json(repaired.text or "")
+            except Exception as repair_error:
+                raise ValueError(
+                    "Gemma could not produce the required structured result. "
+                    "Please retry once with clearer/cropped images."
+                ) from repair_error
 
 
 def normalize_student_result(data: dict[str, Any]) -> dict[str, Any]:
@@ -67,21 +211,30 @@ def normalize_student_result(data: dict[str, Any]) -> dict[str, Any]:
         "follow_up_suggestions": [],
         "teacher_note": "",
     }
+    if not isinstance(data, dict):
+        data = {}
     for key, value in defaults.items():
         data.setdefault(key, value)
     if data["status"] not in STATUS_OPTIONS:
         data["status"] = "Incomplete or Unclear"
+    if data["confidence"] not in {"high", "medium", "low"}:
+        data["confidence"] = "low"
     if data["error_category"] not in ERROR_CATEGORIES:
         data["error_category"] = "Other"
     for key in ["what_was_done_well", "corrected_solution_steps", "follow_up_suggestions"]:
         if not isinstance(data[key], list):
-            data[key] = [str(data[key])]
+            data[key] = [str(data[key])] if data[key] else []
+        data[key] = [str(item) for item in data[key]]
+    for key in defaults:
+        if key not in {"what_was_done_well", "corrected_solution_steps", "follow_up_suggestions"}:
+            data[key] = str(data[key])
     return data
 
 
 def analyze_student_submission(question_text, answer_text, question_upload, answer_upload, level):
     question_image = upload_to_gemma(question_upload)
     answer_image = upload_to_gemma(answer_upload)
+
     prompt = f"""
 You are MathBridge, a Bangla-first diagnostic STEM tutor for Bangladesh.
 
@@ -95,39 +248,34 @@ TYPED QUESTION:
 TYPED STUDENT ANSWER:
 {answer_text or "[No typed answer provided]"}
 
-The answer may be partial, fully correct, partly correct, fully incorrect, or unclear.
-Transcribe all available inputs, find the FIRST incorrect or missing step, preserve
-correct work, classify the mistake, explain how to repair it, and generate a
-level-appropriate corrected solution and retry task.
+Analyze the question and the student's attempted solution. The attempt may be
+partial, fully correct, partly correct, fully incorrect, or unclear.
 
-Return ONLY valid JSON with this schema:
-{{
-  "status": "Fully Correct | Partially Correct | Fully Incorrect | Incomplete or Unclear",
-  "confidence": "high | medium | low",
-  "question_transcription": "plain readable transcription",
-  "answer_transcription": "plain readable transcription preserving steps",
-  "first_error_step": "the exact first wrong or missing step, or No mathematical mistake detected",
-  "first_error_explanation": "Bangla explanation suited to the level",
-  "error_category": "one of {ERROR_CATEGORIES}",
-  "what_was_done_well": ["specific correct observations"],
-  "corrected_solution_steps": ["step 1", "step 2"],
-  "remediation_lesson": "targeted Bangla mini-lesson",
-  "retry_problem": "one related problem",
-  "retry_answer": "answer with brief reasoning",
-  "copyable_solution": "clean corrected solution in plain text, one step per line",
-  "follow_up_suggestions": ["question 1", "question 2", "question 3"],
-  "teacher_note": "one concise diagnostic note"
-}}
+Requirements:
+- Transcribe the question and answer faithfully.
+- Check the student's steps in their written order.
+- Identify the FIRST incorrect or missing step, not merely the final answer.
+- Preserve and praise correct work before that point.
+- If the work is fully correct, use status Fully Correct, category No Error,
+  and first_error_step exactly: No mathematical mistake detected.
+- If handwriting is genuinely ambiguous, lower confidence and say what is unclear.
+- Explain the diagnosis in Bangla at the selected level.
+- Produce a clean corrected solution with one step per line.
+- Return only the structured diagnostic object requested by the response schema.
 """
+
     contents: list[Any] = [prompt]
     if question_image is not None:
-        contents.append(question_image)
+        contents.extend(["QUESTION IMAGE:", question_image])
     if answer_image is not None:
-        contents.append(answer_image)
-    response = get_client().models.generate_content(model=MODEL_NAME, contents=contents)
-    if not response.text:
-        raise RuntimeError("Gemma returned an empty response.")
-    return normalize_student_result(extract_json(response.text))
+        contents.extend(["STUDENT ANSWER IMAGE:", answer_image])
+
+    result = _generate_structured(
+        contents,
+        STUDENT_RESULT_SCHEMA,
+        "a MathBridge student mistake-diagnosis object",
+    )
+    return normalize_student_result(result)
 
 
 def answer_student_follow_up(question: str, level: str, analysis: dict, history: list[dict]) -> str:
@@ -163,8 +311,8 @@ a one-click copy button.
 
 def prepare_student_pdf_content(level: str, analysis: dict, history: list[dict]) -> dict:
     prompt = f"""
-Create a polished English-only student diagnostic report from the JSON and chat.
-The final text will be placed into a PDF.
+Create a polished English-only student diagnostic report from the diagnostic
+object and follow-up chat.
 
 Requirements:
 - Use readable English only.
@@ -172,15 +320,17 @@ Requirements:
 - Write equations in plain readable notation, for example: (a+b)^2 = a^2 + 2ab + b^2.
 - Preserve the logical sequence of the corrected solution.
 - Summarize follow-up conversation faithfully.
-- Return ONLY valid JSON with string fields:
-  title, verdict, transcriptions, first_mistake, what_was_correct,
-  corrected_solution, remediation, retry_practice, conversation_summary.
+- Return only the structured report object requested by the response schema.
 
 LEVEL: {level}
 ANALYSIS: {json.dumps(analysis, ensure_ascii=False)}
 CHAT: {json.dumps(history, ensure_ascii=False)}
 """
-    response = get_client().models.generate_content(model=MODEL_NAME, contents=prompt)
-    if not response.text:
-        raise RuntimeError("Gemma returned an empty PDF export response.")
-    return extract_json(response.text)
+    result = _generate_structured(
+        prompt,
+        PDF_EXPORT_SCHEMA,
+        "a clean English MathBridge PDF report object",
+    )
+    if not isinstance(result, dict):
+        raise ValueError("Gemma returned an invalid PDF export object.")
+    return result
